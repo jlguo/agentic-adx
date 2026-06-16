@@ -1,0 +1,110 @@
+# GPU Host Deployment — runs ONLY GPR inference services with GPU acceleration.
+# The ADX core, Kafka, Prometheus, etc. run on the main host and connect to
+# these services over the network.
+#
+# Usage on GPU host:
+#   docker compose -f deploy/docker-compose.gpu.yml --profile gpu up -d
+#
+# On the ADX host, point env vars at this host:
+#   GPR_ADDR=<gpu-host>:8080
+#   GPR_REDIS_ADDR=<gpu-host>:6379
+
+version: "3.8"
+
+services:
+  redis:
+    image: redis:7.2-alpine
+    container_name: adx-redis-gpu
+    ports:
+      - "6379:6379"
+    networks:
+      - adx-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  mysql:
+    image: mysql:8.0
+    container_name: adx-mysql-gpu
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root_pass
+      MYSQL_DATABASE: adx
+      MYSQL_USER: adx
+      MYSQL_PASSWORD: adx_pass
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./schema/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - adx-net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot_pass"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  llama-gpu:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.llama-gpu
+    container_name: adx-llama-gpu
+    profiles:
+      - gpu
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../models/qwen2-1.5b:/models:ro
+    networks:
+      - adx-net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  gpr-scorer-gpu:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.gpr-scorer-gpu
+    container_name: adx-gpr-scorer-gpu
+    profiles:
+      - gpu
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_USER: adx
+      MYSQL_PASS: adx_pass
+      MYSQL_DB: adx
+      REDIS_ADDR: redis:6379
+      SCORE_INTERVAL: "30"
+      DEVICE: cuda
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    networks:
+      - adx-net
+    depends_on:
+      redis:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+networks:
+  adx-net:
+    driver: bridge
+
+volumes:
+  mysql_data:
+  hf_cache:

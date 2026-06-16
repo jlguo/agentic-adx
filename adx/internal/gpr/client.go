@@ -6,13 +6,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"sync/atomic"
 	"time"
 )
 
 type GPRClient struct {
-	baseURL string
-	http    *http.Client
+	baseURL                string
+	http                   *http.Client
+	consecutiveFallbacks   atomic.Int64
 }
 
 type GPRRequest struct {
@@ -83,31 +86,51 @@ func (c *GPRClient) Score(ctx context.Context, userContext string, ads []GPRRequ
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return c.fallbackScores(ads), fmt.Errorf("gpr request: %w", err)
+		scores := c.fallbackScores(ads)
+		c.logFallback("gpr request: %v", err)
+		return scores, fmt.Errorf("gpr request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return c.fallbackScores(ads), fmt.Errorf("gpr status %d", resp.StatusCode)
+		scores := c.fallbackScores(ads)
+		c.logFallback("gpr status %d", resp.StatusCode)
+		return scores, fmt.Errorf("gpr status %d", resp.StatusCode)
 	}
 
 	respBody, _ := io.ReadAll(resp.Body)
 
 	var vllmResp vLLMResponse
 	if err := json.Unmarshal(respBody, &vllmResp); err != nil {
-		return c.fallbackScores(ads), fmt.Errorf("gpr decode: %w", err)
+		scores := c.fallbackScores(ads)
+		c.logFallback("gpr decode: %v", err)
+		return scores, fmt.Errorf("gpr decode: %w", err)
 	}
 
 	if len(vllmResp.Choices) == 0 {
-		return c.fallbackScores(ads), fmt.Errorf("gpr empty response")
+		scores := c.fallbackScores(ads)
+		c.logFallback("gpr empty response")
+		return scores, fmt.Errorf("gpr empty response")
 	}
 
 	var scores []GPRResponse
 	if err := json.Unmarshal([]byte(vllmResp.Choices[0].Message.Content), &scores); err != nil {
-		return c.fallbackScores(ads), fmt.Errorf("gpr parse scores: %w", err)
+		fbScores := c.fallbackScores(ads)
+		c.logFallback("gpr parse scores: %v", err)
+		return fbScores, fmt.Errorf("gpr parse scores: %w", err)
 	}
 
+	c.consecutiveFallbacks.Store(0)
 	return scores, nil
+}
+
+func (c *GPRClient) logFallback(format string, args ...any) {
+	count := c.consecutiveFallbacks.Add(1)
+	if count == 1 {
+		log.Printf("GPR fallback activated (reason: %s) — switching to fallback scores", fmt.Sprintf(format, args...))
+	} else if count%100 == 0 {
+		log.Printf("GPR still in fallback (%d consecutive failures)", count)
+	}
 }
 
 func (c *GPRClient) fallbackScores(ads []GPRRequest) []GPRResponse {

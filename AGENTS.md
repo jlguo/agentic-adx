@@ -12,7 +12,7 @@ GPR (Generative Pre-trained Recommendation) ADX — an agentic ad exchange that 
 |---|---|---|
 | 1. Access Gateway | Traffic ingress, rate limiting, OpenRTB 2.5 protocol parsing | ✅ |
 | 2. ADX Trading (hot path) | Budget/frequency filtering, vector recall, GPR invocation (cached via Redis), second-price auction, **A/B traffic routing** | ✅ |
-| 3. GPR AI Sorting | Hybrid: llama.cpp server (agent LLM) + PyTorch CPU batch scorer (Redis-cached scoring) | ✅ |
+| 3. GPR AI Sorting | Hybrid: llama.cpp server (agent LLM) + PyTorch batch scorer (Redis-cached scoring, GPU/CPU auto-detect) | ✅ |
 | 4. Data Loop | Kafka→sample cleaning→LoRA fine-tune trigger→vector index update | ✅ |
 | 5. AI Agent Control (side-path) | Creative generation + bidding optimization agents — **NEVER in the RTB hot path** | ✅ |
 
@@ -38,7 +38,15 @@ gpr/                    # GPR model (Layer 3)
 ├── embedding/          # Sentence-transformer ad embedding (384-dim)
 ├── train/              # LoRA pretraining (Criteo/Avazu + TSV samples)
 ├── serve/              # vLLM serving configuration
-│   └── cpu_scorer.py   # PyTorch CPU batch scorer (→ Redis cache)
+│   └── cpu_scorer.py   # PyTorch batch scorer (GPU/CPU auto-detect → Redis cache)
+
+deploy/
+├── docker-compose.yml        # Full stack (14 services, all CPU)
+├── docker-compose.gpu.yml    # GPU host services (llama-gpu + gpr-scorer-gpu)
+├── Dockerfile.llama          # llama.cpp CPU server
+├── Dockerfile.llama-gpu      # llama.cpp CUDA server (--n_gpu_layers -1)
+├── Dockerfile.gpr-scorer     # PyTorch CPU batch scorer
+├── Dockerfile.gpr-scorer-gpu # PyTorch CUDA batch scorer
 
 data/
 └── flink/              # Data loop (Layer 4)
@@ -125,6 +133,52 @@ draft/                  # Architecture spec (product-idea.md)
 ```
 
 See `demo/demo_flow.md` for the 6-part presenter script (15-20 min walkthrough).
+
+## GPU Deployment
+
+The GPR inference layer supports GPU acceleration via a separate Docker Compose stack on a GPU host.
+
+**Architecture**: ADX core runs on the main host, GPU inference services run on a remote GPU host. The ADX connects to them over the network via `GPR_ADDR` and `GPR_REDIS_ADDR`.
+
+### GPU host setup
+
+```bash
+# On the GPU host:
+docker compose -f deploy/docker-compose.gpu.yml --profile gpu up -d
+```
+
+This starts 4 services: `redis`, `mysql`, `llama-gpu` (llama.cpp with `--n_gpu_layers -1`), and `gpr-scorer-gpu` (PyTorch CUDA batch scorer).
+
+### ADX host configuration
+
+Point the ADX at the GPU host by setting these env vars in `docker-compose.yml`:
+
+```yaml
+environment:
+  GPR_ADDR: <gpu-host-ip>:8080        # llama.cpp GPU server
+  GPR_REDIS_ADDR: <gpu-host-ip>:6379  # Redis with pre-computed GPU scores
+```
+
+The ADX reads pre-computed GPR scores from Redis (written by `gpr-scorer-gpu`), falling back to direct llama.cpp invocation and finally to a hardcoded fallback (CTR=0.02, CVR=0.01).
+
+### Scoring flow (GPU mode)
+
+```
+gpr-scorer-gpu (every 30s):
+  MySQL → tokenize → Qwen2-1.5B backbone (CUDA) → CTR/CVR/ECPM heads (CUDA) → Redis
+
+ADX per request:
+  Redis cache hit → O(1) lookup (fast path)
+  Redis cache miss → llama-gpu /v1/chat/completions → fallback scores
+```
+
+### GPU scoring env vars
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `DEVICE` | `auto` | Device override: `auto`, `cuda`, `cuda:0`, `cpu` |
+| `GPR_ADDR` | `localhost:8000` | llama.cpp server address from ADX perspective |
+| `GPR_REDIS_ADDR` | same as `REDIS_ADDR` | Redis for score cache (may be on GPU host) |
 
 ## Service Port Map
 

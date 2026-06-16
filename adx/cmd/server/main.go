@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"net"
 	"net/http"
@@ -54,6 +55,7 @@ var (
 	lr      *fallback.LRScorer
 	rf      *filter.RedisFilter
 	ep      *event.EventProducer
+	abMgr   *ab.ExperimentManager
 	tracer  trace.Tracer
 )
 
@@ -69,6 +71,10 @@ func main() {
 	redisAddr := envOrDefault("REDIS_ADDR", "localhost:6379")
 	qdrantAddr := envOrDefault("QDRANT_ADDR", "localhost:6333")
 	gprAddr := envOrDefault("GPR_ADDR", "localhost:8000")
+
+	// GPR_REDIS_ADDR allows the score cache to use a separate Redis instance
+	// (e.g., on the GPU host where the scorer writes). Falls back to REDIS_ADDR.
+	gprRedisAddr := envOrDefault("GPR_REDIS_ADDR", redisAddr)
 
 	var err error
 	rf, err = filter.NewRedisFilter(redisAddr)
@@ -108,7 +114,7 @@ func main() {
 
 	// Initialize A/B experiment manager (non-fatal if MySQL is unavailable).
 	mysqlDSN := envOrDefault("MYSQL_DSN", "adx:adx_pass@tcp(localhost:3306)/adx?parseTime=true")
-	abMgr, err := ab.NewExperimentManager(mysqlDSN)
+	abMgr, err = ab.NewExperimentManager(mysqlDSN)
 	if err != nil {
 		log.Printf("WARNING: AB manager unavailable (%v) — experiments disabled", err)
 	} else {
@@ -117,13 +123,12 @@ func main() {
 		log.Printf("AB manager connected: %s", mysqlDSN)
 	}
 
-	// Initialize Redis score cache for GPR (pre-computed by cpu_scorer.py).
-	// Non-fatal: if Redis is unavailable, scoring falls back to GPRClient → LR.
-	if sc, err := gpr.NewScoreCache(redisAddr); err != nil {
-		log.Printf("WARNING: GPR score cache unavailable (%v) — using GPR client directly", err)
+	if sc, err := gpr.NewScoreCache(gprRedisAddr); err != nil {
+		log.Printf("WARNING: GPR score cache unavailable at %s (%v) — using GPR client directly",
+			gprRedisAddr, err)
 	} else {
 		p.SetScoreCache(sc)
-		log.Printf("GPR score cache connected: %s", redisAddr)
+		log.Printf("GPR score cache connected: %s", gprRedisAddr)
 	}
 
 	kafkaAddr := envOrDefault("KAFKA_ADDR", "localhost:9092")
@@ -139,6 +144,7 @@ func main() {
 	router.Use(gin.Recovery())
 	router.GET("/health", handleHealth)
 	router.POST("/bid", handleBid)
+	router.GET("/api/creative/:id", handleCreative)
 
 	go func() {
 		srv := &http.Server{Addr: ":8080", Handler: router}
@@ -176,6 +182,31 @@ func main() {
 
 func handleHealth(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func handleCreative(c *gin.Context) {
+	idStr := c.Param("id")
+	if abMgr == nil || abMgr.DB() == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+
+	var cr model.Creative
+	var tagsStr string
+	err := abMgr.DB().QueryRowContext(c.Request.Context(),
+		`SELECT id, campaign_id, COALESCE(title,''), COALESCE(description,''),
+		        COALESCE(image_url,''), COALESCE(landing_url,''),
+		        COALESCE(category,''), COALESCE(tags,'[]'), COALESCE(status,'')
+		 FROM creatives WHERE id = ?`, idStr).
+		Scan(&cr.ID, &cr.CampaignID, &cr.Title, &cr.Description,
+			&cr.ImageURL, &cr.LandingURL, &cr.Category, &tagsStr,
+			&cr.Status)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "creative not found"})
+		return
+	}
+	cr.Tags = json.RawMessage(tagsStr)
+	c.JSON(http.StatusOK, cr)
 }
 
 func handleBid(c *gin.Context) {

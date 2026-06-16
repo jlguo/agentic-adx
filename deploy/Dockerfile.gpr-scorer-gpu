@@ -1,0 +1,12 @@
+FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+
+RUN pip install --no-cache-dir transformers peft accelerate redis pymysql huggingface_hub sentencepiece
+
+WORKDIR /app
+
+COPY gpr/ gpr/
+COPY data/ data/
+
+ENV DEVICE=cuda
+
+CMD ["python", "gpr/serve/cpu_scorer.py"]

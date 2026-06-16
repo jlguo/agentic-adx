@@ -72,6 +72,7 @@ class ScorerConfig:
     max_length: int = 512
     batch_size: int = 64
     dtype: str = "bfloat16"
+    device: str = "auto"  # "auto", "cuda", "cuda:0", or "cpu"
 
     # -- Data sources ---------------------------------------------------------
     mysql_host: str = "localhost"
@@ -106,12 +107,14 @@ class ScorerConfig:
         cfg.mysql_db = os.getenv("MYSQL_DB", cfg.mysql_db)
         cfg.redis_addr = os.getenv("REDIS_ADDR", cfg.redis_addr)
         cfg.score_interval = int(os.getenv("SCORE_INTERVAL", str(cfg.score_interval)))
+        cfg.device = os.getenv("DEVICE", cfg.device)
 
         # CLI arg overrides (highest priority)
         if args is not None:
             for key in (
                 "model_path", "mysql_host", "mysql_user", "mysql_pass",
                 "mysql_db", "redis_addr", "score_interval", "batch_size",
+                "device",
             ):
                 val = getattr(args, key, None)
                 if val is not None:
@@ -233,11 +236,19 @@ class BatchScorer:
 
     def __init__(self, config: ScorerConfig):
         self.config = config
-        self.device = torch.device("cpu")
+        self.device = self._resolve_device(config.device)
         self.tokenizer: Optional[AutoTokenizer] = None
         self.backbone: Optional[nn.Module] = None
         self.heads: Optional[GPRHeads] = None
         self.redis_client: Optional[redis.Redis] = None
+
+    @staticmethod
+    def _resolve_device(device_spec: str) -> torch.device:
+        if device_spec == "cpu":
+            return torch.device("cpu")
+        if device_spec == "auto":
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.device(device_spec)
 
     # -- Model loading -------------------------------------------------------
 
@@ -254,6 +265,7 @@ class BatchScorer:
             torch_dtype = torch.float32
 
         model_path = self.config.model_path
+        device_str = str(self.device)
         logger.info("Loading tokenizer from %s ...", model_path)
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path,
@@ -264,24 +276,33 @@ class BatchScorer:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             logger.info("Set pad_token = eos_token (%s)", self.tokenizer.pad_token)
 
-        logger.info("Loading backbone from %s (dtype=%s) ...", model_path, self.config.dtype)
+        logger.info("Loading backbone from %s (dtype=%s, device=%s) ...",
+                     model_path, self.config.dtype, device_str)
         hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         self.backbone = AutoModel.from_pretrained(
             model_path,
             config=hf_config,
             trust_remote_code=True,
             torch_dtype=torch_dtype,
-            device_map="cpu",
         )
         assert self.backbone is not None
+        self.backbone.to(self.device)
         self.backbone.eval()
 
         logger.info("Initialising GPR heads (hidden_size=%d) ...", self.config.hidden_size)
         self.heads = GPRHeads(self.config)
+        self.heads.to(self.device)
         self.heads.eval()
 
         elapsed = time.monotonic() - t0
-        logger.info("GPR CPU scorer started, model loaded in %.1fs", elapsed)
+        gpu_info = ""
+        if self.device.type == "cuda":
+            gpu_info = " (GPU: %s, VRAM: %.1fGB)" % (
+                torch.cuda.get_device_name(self.device),
+                torch.cuda.get_device_properties(self.device).total_mem / 1024**3,
+            )
+        logger.info("GPR scorer started on %s%s, model loaded in %.1fs",
+                     device_str, gpu_info, elapsed)
 
     # -- Data-source connections ---------------------------------------------
 
@@ -573,6 +594,12 @@ def main() -> None:
         help="Torch dtype for model weights",
     )
     parser.add_argument(
+        "--device",
+        default=os.getenv("DEVICE", "auto"),
+        choices=["auto", "cpu", "cuda", "cuda:0", "cuda:1"],
+        help="Device to run on: auto (detect GPU), cpu, cuda (env: DEVICE)",
+    )
+    parser.add_argument(
         "--once",
         action="store_true",
         help="Run a single scoring cycle and exit",
@@ -583,6 +610,7 @@ def main() -> None:
     config.model_path = args.model_path
     config.dtype = args.dtype
     config.batch_size = args.batch_size
+    config.device = args.device
 
     scorer = BatchScorer(config)
 

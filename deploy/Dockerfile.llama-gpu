@@ -1,0 +1,23 @@
+FROM nvidia/cuda:12.4.0-runtime-ubuntu22.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 python3.12-venv python3-pip cmake build-essential libgomp1 && \
+    ln -s /usr/bin/python3.12 /usr/bin/python && \
+    CMAKE_ARGS="-DLLAMA_CUBLAS=on" pip install --no-cache-dir llama-cpp-python[server] && \
+    apt-get remove -y cmake build-essential && apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=15s --timeout=5s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/v1/models')" || exit 1
+
+CMD python -m llama_cpp.server \
+    --model /models/qwen2-1_5b-instruct-q4_k_m.gguf \
+    --host 0.0.0.0 \
+    --port 8080 \
+    --n_ctx 2048 \
+    --n_threads 8 \
+    --n_gpu_layers -1
