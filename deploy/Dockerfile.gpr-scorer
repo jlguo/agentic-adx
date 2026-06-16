@@ -1,0 +1,11 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir transformers peft accelerate redis pymysql huggingface_hub sentencepiece
+
+COPY gpr/ gpr/
+COPY data/ data/
+
+CMD ["python", "gpr/serve/cpu_scorer.py"]

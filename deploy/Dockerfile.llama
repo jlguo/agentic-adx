@@ -1,0 +1,21 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends cmake build-essential libgomp1 && \
+    pip install --no-cache-dir llama-cpp-python[server] && \
+    apt-get remove -y cmake build-essential && apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=15s --timeout=5s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/v1/models')" || exit 1
+
+CMD python -m llama_cpp.server \
+    --model /models/qwen2-1_5b-instruct-q4_k_m.gguf \
+    --host 0.0.0.0 \
+    --port 8080 \
+    --n_ctx 2048 \
+    --n_threads 8 \
+    --n_gpu_layers 0

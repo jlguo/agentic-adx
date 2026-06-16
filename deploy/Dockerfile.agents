@@ -1,0 +1,14 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock ./
+
+RUN pip install --no-cache-dir uv && \
+    uv pip install --system langchain langchain-openai langchain-core \
+        pymysql redis sentence-transformers numpy clickhouse-connect
+
+COPY gpr/ gpr/
+COPY agents/ agents/
+
+CMD ["python", "-m", "agents.bidding_agent"]

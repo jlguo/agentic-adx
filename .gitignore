@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+
+# Go
+*.exe
+*.test
+*.out
+
+# Docker
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Session artifacts
+.sisyphus/
+
+# OS
+.DS_Store
+Thumbs.db
+sim/sim
+models/
