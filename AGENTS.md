@@ -264,23 +264,23 @@ python3.9 /tmp/test_gpr.py
 
 | Term | Definition |
 |------|-----------|
-| **GPR** | Generative Pre-trained Recommendation — a single LLM-based model that predicts CTR/CVR/eCPM, replacing traditional recall→coarse-rank→fine-rank pipelines |
-| **DeepFM** | Deep Factorization Machine — a traditional deep learning model for CTR prediction used as the **control** variant in A/B experiments |
-| **CTR** | Click-Through Rate — probability a user clicks an ad (0–1) |
-| **CVR** | Conversion Rate — probability a click leads to a conversion/purchase (0–1) |
-| **eCPM** | Effective Cost Per Mille — predicted revenue per 1000 impressions; `eCPM = CVR × bid_price × 1000` |
-| **OpenRTB 2.5** | Open Real-Time Bidding protocol — industry standard JSON format for programmatic ad auctions |
-| **SPD** | Second-Price auction — winner pays the second-highest bid plus one cent, not their own full bid |
+| **Generative Pre-trained Recommendation (GPR)** | A single LLM-based model that predicts CTR/CVR/eCPM, replacing traditional recall→coarse-rank→fine-rank pipelines |
+| **Deep Factorization Machine (DeepFM)** | A traditional deep learning model for CTR prediction used as the **control** variant in A/B experiments |
+| **Click-Through Rate (CTR)** | Probability a user clicks an ad (0–1) |
+| **Conversion Rate (CVR)** | Probability a click leads to a conversion/purchase (0–1) |
+| **Effective Cost Per Mille (eCPM)** | Predicted revenue per 1000 impressions; `eCPM = CVR × bid_price × 1000` |
+| **Open Real-Time Bidding 2.5 (OpenRTB)** | Industry standard JSON format for programmatic ad auctions |
+| **Second-Price Auction (SPD)** | Winner pays the second-highest bid plus one cent, not their own full bid |
 | **llama.cpp** | Lightweight C++ inference engine for LLMs; runs Qwen2-1.5B in Q4 quantized GGUF format; supports CPU and GPU via `--n_gpu_layers` |
-| **GGUF** | GPT-Generated Unified Format — quantized model file format for llama.cpp (Q4_K_M: ~941MB vs BF16: ~3GB) |
+| **GPT-Generated Unified Format (GGUF)** | Quantized model file format for llama.cpp (Q4_K_M: ~941MB vs BF16: ~3GB) |
 | **Qdrant** | Vector database for semantic similarity search; stores 384-dim ad embeddings; powers the vector recall step (semantic top-K candidate retrieval, not RAG) |
-| **A/B routing** | CRC32 hash-based deterministic traffic splitting between control (DeepFM) and treatment (GPR); O(1), no DB query in hot path |
-| **LoRA** | Low-Rank Adaptation — parameter-efficient fine-tuning method; only trains small adapter weights on top of frozen LLM backbone |
+| **A/B Experiment Routing** | CRC32 hash-based deterministic traffic splitting between control (DeepFM) and treatment (GPR); O(1), no DB query in hot path |
+| **Low-Rank Adaptation (LoRA)** | Parameter-efficient fine-tuning method; only trains small adapter weights on top of frozen LLM backbone |
 | **Redis ScoreCache** | Pre-computed GPR scores for all active creatives, refreshed every 30s by `cpu_scorer.py`; ADX reads via O(1) HSET lookup |
-| **Fallback** | 3-tier scoring safety net: ① Redis cache → ② llama.cpp (GPU with auto CPU fallback) → ③ hardcoded CTR=0.02 only when server unreachable |
-| **Kafka** | Event streaming platform; ADX asynchronously produces impression/click/conversion events; consumed by data loop for training |
-| **Side-path** | AI agents (bidding optimization, creative generation) operate on DB/cache only — never in the synchronous RTB request path |
-| **Hot path** | Synchronous RTB request processing pipeline; P99 latency target <100ms; spans Nginx → ADX → Redis → Qdrant → Auction → Response |
+| **Fallback Scoring** | 3-tier safety net: ① Redis cache → ② llama.cpp (GPU with auto CPU fallback) → ③ hardcoded CTR=0.02 only when server unreachable |
+| **Apache Kafka** | Event streaming platform; ADX asynchronously produces impression/click/conversion events; consumed by data loop for training |
+| **Side-path (Agent)** | AI agents (bidding optimization, creative generation) operate on DB/cache only — never in the synchronous RTB request path |
+| **Hot Path** | Synchronous RTB request processing pipeline; P99 latency target <100ms; spans Nginx → ADX → Redis → Qdrant → Auction → Response |
 
 ## Running
 
