@@ -15,6 +15,7 @@ sequenceDiagram
     participant AB as 🧪 AB Manager
     participant RC as 💾 Redis ScoreCache
     participant LLM as 🧠 llama.cpp (GPU)
+    participant FB as ⚠️ Fallback
     participant BL as 📈 Baseline DeepFM
     participant AU as 🏷️ Auction
     participant KF as 📨 Kafka
@@ -33,10 +34,16 @@ sequenceDiagram
         BL-->>ADX: CTR/CVR/eCPM predictions
     else Variant = treatment
         ADX->>RC: HGETALL gpr_score:<ad_id>
-        RC-->>ADX: Cached scores (hit)
-        opt Cache miss
+        alt Cache HIT (O(1), ~1ms)
+            RC-->>ADX: Pre-computed GPU scores
+        else Cache MISS → LLM fallback
             ADX->>LLM: POST /v1/chat/completions
-            LLM-->>ADX: JSON scores (CTR/CVR/eCPM)
+            alt LLM OK (~445ms GPU)
+                LLM-->>ADX: JSON scores (CTR/CVR/eCPM)
+            else LLM timeout/error → hardcoded
+                ADX->>FB: fallbackScores()
+                FB-->>ADX: CTR=0.02, CVR=0.01, eCPM=bid*20
+            end
         end
     end
 
@@ -46,7 +53,7 @@ sequenceDiagram
     ADX-->>NG: BidResponse
     NG-->>SSP: BidResponse
 
-    Note over RC,LLM: Background: cpu_scorer.py batch-scores<br/>all creatives every 30s via PyTorch CUDA → Redis
+    Note over RC,FB: 3-tier fallback: cache → LLM → hardcoded<br/>Rate-limited logging (every 100th fallback)
 ```
 
 ### Background Services
@@ -200,7 +207,7 @@ export GPR_REDIS_ADDR=<gpu-host>:6379
 - **No token decoding**: GPR is a discriminative model with structured output heads (CTR/CVR/eCPM), not text generation
 - **Second-price auction** with reserve/floor pricing
 - **A/B framework**: CRC32 hash-based deterministic routing; control=DeepFM, treatment=GPR
-- **Timeout fallback**: GPR timeout → traditional LR scoring (no degradation)
+- **3-tier GPR fallback**: ① Redis cache (O(1), ~1ms) → ② llama.cpp GPU (POST /v1/chat/completions, ~445ms) → ③ hardcoded fallback (CTR=0.02, CVR=0.01). Rate-limited logging prevents log spam during extended outages.
 - **Hybrid scoring**: llama.cpp server for agent LLM; batch scorer pre-computes all creatives every 30s via PyTorch CUDA → Redis cache → O(1) pipeline lookup
 - **GPU acceleration**: Supports remote GPU host (RTX 4090 verified); CPU fallback via `DEVICE=auto`
 - **All open-source**: no commercial dependencies, privately deployable
