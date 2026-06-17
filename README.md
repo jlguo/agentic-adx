@@ -211,3 +211,5 @@ export GPR_REDIS_ADDR=<gpu-host>:6379
 - **Hybrid scoring**: llama.cpp server for agent LLM; batch scorer pre-computes all creatives every 30s via PyTorch CUDA → Redis cache → O(1) pipeline lookup
 - **GPU acceleration**: Supports remote GPU host (RTX 4090 verified); CPU fallback via `DEVICE=auto`
 - **All open-source**: no commercial dependencies, privately deployable
+
+See [AGENTS.md](AGENTS.md#terminology) for a full terminology glossary (GPR, DeepFM, CTR/CVR/eCPM, SPD, GGUF, etc.).
