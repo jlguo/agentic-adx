@@ -38,9 +38,9 @@ sequenceDiagram
             RC-->>ADX: Pre-computed GPU scores
         else Cache MISS → LLM fallback
             ADX->>LLM: POST /v1/chat/completions
-            alt LLM OK (~445ms GPU, higher CPU)
+            alt LLM OK (GPU → auto CPU fallback)
                 LLM-->>ADX: JSON scores (CTR/CVR/eCPM)
-            else LLM unreachable/error → hardcoded
+            else LLM unreachable → hardcoded
                 ADX->>FB: fallbackScores()
                 FB-->>ADX: CTR=0.02, CVR=0.01, eCPM=bid×20
             end
@@ -53,7 +53,7 @@ sequenceDiagram
     ADX-->>NG: BidResponse
     NG-->>SSP: BidResponse
 
-    Note over RC,FB: 3-tier fallback: cache → LLM → hardcoded<br/>Rate-limited logging (every 100th fallback)
+    Note over RC,FB: llama.cpp auto-falls back CPU↔GPU via --n_gpu_layers<br/>Hardcoded fallback only if server itself is down
 ```
 
 ### Background Services
@@ -207,7 +207,7 @@ export GPR_REDIS_ADDR=<gpu-host>:6379
 - **No token decoding**: GPR is a discriminative model with structured output heads (CTR/CVR/eCPM), not text generation
 - **Second-price auction** with reserve/floor pricing
 - **A/B framework**: CRC32 hash-based deterministic routing; control=DeepFM, treatment=GPR
-- **3-tier GPR fallback**: ① Redis cache (O(1), ~1ms) → ② llama.cpp server (POST /v1/chat/completions, CPU or GPU via `--n_gpu_layers`) → ③ hardcoded fallback (CTR=0.02, CVR=0.01) when llama.cpp is unreachable. Rate-limited logging prevents log spam.
+- **3-tier GPR fallback**: ① Redis cache (O(1), ~1ms) → ② llama.cpp (GPU with auto CPU fallback via `--n_gpu_layers`) → ③ hardcoded (CTR=0.02, CVR=0.01) only when server is unreachable
 - **Hybrid scoring**: llama.cpp server for agent LLM; batch scorer pre-computes all creatives every 30s via PyTorch CUDA → Redis cache → O(1) pipeline lookup
 - **GPU acceleration**: Supports remote GPU host (RTX 4090 verified); CPU fallback via `DEVICE=auto`
 - **All open-source**: no commercial dependencies, privately deployable
