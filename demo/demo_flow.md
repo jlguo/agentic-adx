@@ -48,42 +48,117 @@ watch -n 2 'curl -s localhost:9091/metrics | grep adx_'
 ### The Architecture
 
 ```mermaid
-flowchart TB
-    subgraph Hot["RTB Hot Path &lt;5ms P99"]
-        SSP["SSP Simulator"] -->|"OpenRTB 2.5"| NGINX["Nginx Gateway"]
-        NGINX --> ADX["Go ADX Core"]
-        ADX --> FILTER["Redis Filter\nBudget/Freq/Blacklist"]
-        ADX --> VEC["Qdrant Vector Recall\nSemantic Top-K, ~2ms"]
-        VEC --> CACHE["Redis Score Cache\nO(1) GET gpr_score:*"]
-        CACHE --> AB["A/B Hash Split\nCRC32 routing"]
-        AB -->|"treatment"| GPR_SCORE["GPR Cached Scores"]
-        AB -->|"control"| BASELINE["DeepFM Baseline"]
-        GPR_SCORE --> AUCTION["Second-Price Auction"]
-        BASELINE --> AUCTION
-        AUCTION --> RES["Bid Response\n(creative_id + price)"]
+sequenceDiagram
+    autonumber
+    participant SSP as SSP Simulator
+    participant NG as Nginx Gateway
+    participant ADX as Go ADX Core
+    participant RF as Redis Filter
+    participant QD as Qdrant Vector
+    participant AB as AB Manager
+    participant RC as Redis ScoreCache
+    participant LLM as llama.cpp (GPU)
+    participant BL as Baseline DeepFM
+    participant AU as Auction
+    participant KF as Kafka
+
+    SSP->>NG: ① POST /bid (OpenRTB 2.5)
+    NG->>NG: Rate limit check
+    NG->>ADX: ② Forward request
+    ADX->>RF: ③ Redis GET budget/freq/blacklist
+    RF-->>ADX: Filter pass/fail
+    ADX->>QD: ④ Search(user_vector, topK=100)
+    QD-->>ADX: Top-K candidates
+    ADX->>AB: ⑤ CRC32 hash → control/treatment
+
+    alt ⑥a Variant = control
+        ADX->>BL: Score(userCtx, ads)
+        BL-->>ADX: CTR/CVR/eCPM
+    else ⑥b Variant = treatment
+        ADX->>RC: HGETALL gpr_score:<ad_id>
+        alt Cache HIT
+            RC-->>ADX: Pre-computed scores (~1ms)
+        else Cache MISS → LLM
+            ADX->>LLM: POST /v1/chat/completions
+            LLM-->>ADX: JSON scores (~445ms GPU)
+        end
     end
 
-    subgraph BG["Background (async, never blocks RTB)"]
-        SCORER["cpu_scorer.py\nPyTorch batch every 30s"]
+    ADX->>AU: ⑦ RunWithECPM(bids, scores)
+    AU-->>ADX: Winning bid
+    ADX->>KF: ⑧ Produce(impression) [async]
+    ADX-->>NG: ⑨ BidResponse
+    NG-->>SSP: ⑩ BidResponse (seatbid[])
+
+    Note over RC,LLM: Background: cpu_scorer.py batch-scores<br/>all creatives every 30s via PyTorch CUDA → Redis
+```
+
+### Background Services
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SCR as cpu_scorer.py (GPU)
+    participant MYS as MySQL
+    participant RED as Redis
+    participant KF as Kafka
+    participant CLN as Sample Cleaner
+    participant TRG as Training Trigger
+    participant VUP as Vector Updater
+    participant QD as Qdrant
+
+    loop Every 30 seconds
+        SCR->>MYS: SELECT active creatives
+        MYS-->>SCR: Creative list
+        SCR->>SCR: Tokenize → Qwen2-1.5B CUDA forward
+        SCR->>RED: HSET gpr_score:<ad_id>
+    end
+
+    ADX-)KF: Impressions / Clicks / Conversions
+    KF->>CLN: Consume + join samples
+    CLN->>CLN: Clean → TSV format
+    CLN->>TRG: Accumulate (threshold: 500 samples)
+    TRG->>TRG: Trigger LoRA fine-tune
+    VUP->>MYS: Poll for updated creatives
+    VUP->>QD: Re-embed + upsert vectors
+```
+
+### System Components
+
+```mermaid
+flowchart TB
+    subgraph Hot["RTB Hot Path &lt;100ms P99"]
+        SSP["SSP Simulator"] -->|"① POST /bid"| NGINX["Nginx Gateway"]
+        NGINX --> ADX["Go ADX Core"]
+        ADX -->|"③ GET"| FILTER["Redis Filter\nBudget/Freq/Blacklist"]
+        ADX -->|"④ Search"| VEC["Qdrant Vector Recall\nSemantic Top-K, ~2ms"]
+        VEC -->|"⑤ CRC32 hash"| AB["A/B Routing"]
+        AB -->|"treatment"| CACHE["Redis Score Cache\n⑥b HGETALL"]
+        AB -->|"control"| BASELINE["DeepFM Baseline\n⑥a Score()"]
+        CACHE -->|"miss → POST"| LLAMA["llama.cpp GPU\n/v1/chat/completions"]
+        CACHE --> AUCTION["⑦ RunWithECPM()"]
+        BASELINE --> AUCTION
+        AUCTION --> RES["⑩ BidResponse"]
+    end
+
+    subgraph BG["Background (async)"]
+        SCORER["cpu_scorer.py\nPyTorch CUDA every 30s"]
         SCORER -->|"HSET"| CACHE
-        LLAMA["llama.cpp\nQwen2-1.5B, OpenAI API"]
     end
 
     subgraph Agents["AI Agents (side-path, hourly)"]
         BID["Bidding Agent\nROAS Optimization"]
         CRT["Creative Agent\nMaterial Generation"]
     end
-    BID -->|"HTTP"| LLAMA
-    CRT -->|"HTTP"| LLAMA
+    BID -->|"POST /v1/chat"| LLAMA
+    CRT -->|"POST /v1/chat"| LLAMA
     CRT -->|"INSERT"| MYSQL[("MySQL\nCreatives")]
-    MYSQL -->|"poll"| VUP["Vector Updater"]
-    VUP -->|"upsert"| VEC
 
-    subgraph Loop["Data Loop"]
-        ADX -->|"fire & forget"| KAFKA["Kafka Events"]
+    subgraph Loop["Data Loop (⑧ Kafka)"]
+        ADX -->|"⑧ fire & forget"| KAFKA["Kafka Events"]
         KAFKA --> CLEAN["Sample Cleaner"]
         CLEAN --> TRAIN["LoRA Fine-tune Trigger"]
-        CLEAN --> VUP
+        VUP["Vector Updater"] -->|"upsert"| VEC
     end
 
     subgraph Obs["Observability"]
@@ -102,10 +177,10 @@ flowchart TB
 ### Architecture Decisions to Highlight
 
 1. **Hybrid GPR scoring** — The key insight:
-   - llama.cpp serves the **agent LLM** (hourly bidding analysis, creative generation)
-   - PyTorch CPU batch-scores all ads into **Redis cache** (every 30s)
-   - ADX hot path reads Redis in **O(1)** — no token generation in the hot path, <<1ms
-   - This is production-grade: async pre-computation + real-time cache lookup
+   - llama.cpp serves the **agent LLM** (hourly bidding analysis, creative generation) and as the cache-miss fallback
+   - PyTorch CUDA batch-scores all ads into **Redis cache** (every 30s)
+   - ADX hot path reads Redis in **O(1)** — no token generation in the hot path, ~1ms lookup
+   - Cache miss → llama.cpp GPU (P50: 445ms on RTX 4090)
 
 2. **A/B is a first-class component** — CRC32 hash-based routing:
    - `hash(experiment_salt + request_id) % 100 < traffic_ratio * 100`
