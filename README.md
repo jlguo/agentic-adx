@@ -5,6 +5,84 @@
 ## Architecture
 
 ```mermaid
+sequenceDiagram
+    autonumber
+    participant SSP as 🖥 SSP Simulator
+    participant NG as 🌐 Nginx Gateway
+    participant ADX as ⚙️ Go ADX Core
+    participant RF as 📊 Redis Filter
+    participant QD as 🔍 Qdrant Vector
+    participant AB as 🧪 AB Manager
+    participant RC as 💾 Redis ScoreCache
+    participant LLM as 🧠 llama.cpp (GPU)
+    participant BL as 📈 Baseline DeepFM
+    participant AU as 🏷️ Auction
+    participant KF as 📨 Kafka
+
+    SSP->>NG: POST /bid (OpenRTB 2.5)
+    NG->>NG: Rate limit check
+    NG->>ADX: Forward bid request
+    ADX->>RF: Redis GET (budget/freq/blacklist)
+    RF-->>ADX: Filter result
+    ADX->>QD: Search(user_vector, topK=100)
+    QD-->>ADX: Top-K ad candidates
+    ADX->>AB: CRC32 hash → control/treatment?
+
+    alt Variant = control
+        ADX->>BL: Score(userCtx, adFeatures)
+        BL-->>ADX: CTR/CVR/eCPM predictions
+    else Variant = treatment
+        ADX->>RC: HGETALL gpr_score:<ad_id>
+        RC-->>ADX: Cached scores (hit)
+        opt Cache miss
+            ADX->>LLM: POST /v1/chat/completions
+            LLM-->>ADX: JSON scores (CTR/CVR/eCPM)
+        end
+    end
+
+    ADX->>AU: RunWithECPM(bids, scores)
+    AU-->>ADX: Winning bid
+    ADX->>KF: Produce(impression event) [async]
+    ADX-->>NG: BidResponse
+    NG-->>SSP: BidResponse
+
+    Note over RC,LLM: Background: cpu_scorer.py batch-scores<br/>all creatives every 30s via PyTorch CUDA → Redis
+```
+
+### Background Services
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SCR as cpu_scorer.py (GPU)
+    participant MYS as MySQL
+    participant RED as Redis
+    participant KF as Kafka
+    participant CLN as Sample Cleaner
+    participant TRG as Training Trigger
+    participant VUP as Vector Updater
+    participant QD as Qdrant
+
+    Note over SCR,RED: Every 30 seconds
+    SCR->>MYS: SELECT active creatives
+    MYS-->>SCR: Creative list
+    SCR->>SCR: Tokenize → Qwen2-1.5B CUDA forward
+    SCR->>RED: HSET gpr_score:<ad_id> {ctr,cvr,ecpm}
+
+    rect rgb(240, 248, 255)
+        Note over KF,QD: Async data loop
+        ADX-)KF: Impressions / Clicks / Conversions
+        KF->>CLN: Consume + join samples
+        CLN->>TRG: Accumulate TSV (threshold: 500)
+        TRG->>TRG: Trigger LoRA fine-tune
+        VUP->>MYS: Poll for updated creatives
+        VUP->>QD: Re-embed + upsert vectors
+    end
+```
+
+### System Architecture
+
+```mermaid
 flowchart LR
     subgraph Hot["RTB Hot Path (<100ms P99)"]
         SS["SSP Simulator"] --> NG["Nginx Gateway"]
