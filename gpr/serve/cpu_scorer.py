@@ -299,7 +299,7 @@ class BatchScorer:
         if self.device.type == "cuda":
             gpu_info = " (GPU: %s, VRAM: %.1fGB)" % (
                 torch.cuda.get_device_name(self.device),
-                torch.cuda.get_device_properties(self.device).total_mem / 1024**3,
+                torch.cuda.get_device_properties(self.device).total_memory / 1024**3,
             )
         logger.info("GPR scorer started on %s%s, model loaded in %.1fs",
                      device_str, gpu_info, elapsed)
