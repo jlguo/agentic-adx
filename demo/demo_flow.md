@@ -57,7 +57,7 @@ sequenceDiagram
     participant QD as Qdrant Vector
     participant AB as AB Manager
     participant RC as Redis ScoreCache
-    participant LLM as llama.cpp (GPU)
+    participant LLM as llama.cpp (CPU|GPU)
     participant BL as Baseline DeepFM
     participant AU as Auction
     participant KF as Kafka
@@ -135,7 +135,7 @@ flowchart TB
         VEC -->|"⑤ CRC32 hash"| AB["A/B Routing"]
         AB -->|"treatment"| CACHE["Redis Score Cache\n⑥b HGETALL"]
         AB -->|"control"| BASELINE["DeepFM Baseline\n⑥a Score()"]
-        CACHE -->|"miss → POST"| LLAMA["llama.cpp GPU\n/v1/chat/completions"]
+        CACHE -->|"miss → POST"| LLAMA["llama.cpp CPU|GPU\n/v1/chat/completions"]
         CACHE --> AUCTION["⑦ RunWithECPM()"]
         BASELINE --> AUCTION
         AUCTION --> RES["⑩ BidResponse"]
@@ -180,7 +180,7 @@ flowchart TB
    - llama.cpp serves the **agent LLM** (hourly bidding analysis, creative generation) and as the cache-miss fallback
    - PyTorch CUDA batch-scores all ads into **Redis cache** (every 30s)
    - ADX hot path reads Redis in **O(1)** — no token generation in the hot path, ~1ms lookup
-   - Cache miss → llama.cpp GPU (P50: 445ms on RTX 4090)
+   - Cache miss → llama.cpp (CPU or GPU via `--n_gpu_layers`, P50: 445ms GPU)
 
 2. **A/B is a first-class component** — CRC32 hash-based routing:
    - `hash(experiment_salt + request_id) % 100 < traffic_ratio * 100`

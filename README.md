@@ -14,7 +14,7 @@ sequenceDiagram
     participant QD as 🔍 Qdrant Vector
     participant AB as 🧪 AB Manager
     participant RC as 💾 Redis ScoreCache
-    participant LLM as 🧠 llama.cpp (GPU)
+    participant LLM as 🧠 llama.cpp<br/>(CPU or GPU)
     participant FB as ⚠️ Fallback
     participant BL as 📈 Baseline DeepFM
     participant AU as 🏷️ Auction
@@ -38,11 +38,11 @@ sequenceDiagram
             RC-->>ADX: Pre-computed GPU scores
         else Cache MISS → LLM fallback
             ADX->>LLM: POST /v1/chat/completions
-            alt LLM OK (~445ms GPU)
+            alt LLM OK (~445ms GPU, higher CPU)
                 LLM-->>ADX: JSON scores (CTR/CVR/eCPM)
-            else LLM timeout/error → hardcoded
+            else LLM unreachable/error → hardcoded
                 ADX->>FB: fallbackScores()
-                FB-->>ADX: CTR=0.02, CVR=0.01, eCPM=bid*20
+                FB-->>ADX: CTR=0.02, CVR=0.01, eCPM=bid×20
             end
         end
     end
@@ -207,7 +207,7 @@ export GPR_REDIS_ADDR=<gpu-host>:6379
 - **No token decoding**: GPR is a discriminative model with structured output heads (CTR/CVR/eCPM), not text generation
 - **Second-price auction** with reserve/floor pricing
 - **A/B framework**: CRC32 hash-based deterministic routing; control=DeepFM, treatment=GPR
-- **3-tier GPR fallback**: ① Redis cache (O(1), ~1ms) → ② llama.cpp GPU (POST /v1/chat/completions, ~445ms) → ③ hardcoded fallback (CTR=0.02, CVR=0.01). Rate-limited logging prevents log spam during extended outages.
+- **3-tier GPR fallback**: ① Redis cache (O(1), ~1ms) → ② llama.cpp server (POST /v1/chat/completions, CPU or GPU via `--n_gpu_layers`) → ③ hardcoded fallback (CTR=0.02, CVR=0.01) when llama.cpp is unreachable. Rate-limited logging prevents log spam.
 - **Hybrid scoring**: llama.cpp server for agent LLM; batch scorer pre-computes all creatives every 30s via PyTorch CUDA → Redis cache → O(1) pipeline lookup
 - **GPU acceleration**: Supports remote GPU host (RTX 4090 verified); CPU fallback via `DEVICE=auto`
 - **All open-source**: no commercial dependencies, privately deployable
