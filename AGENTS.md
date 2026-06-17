@@ -136,49 +136,92 @@ See `demo/demo_flow.md` for the 6-part presenter script (15-20 min walkthrough).
 
 ## GPU Deployment
 
-The GPR inference layer supports GPU acceleration via a separate Docker Compose stack on a GPU host.
+The GPR inference layer supports GPU acceleration on a remote GPU host (tested: RTX 4090, 24GB VRAM, CUDA 12.6).
 
-**Architecture**: ADX core runs on the main host, GPU inference services run on a remote GPU host. The ADX connects to them over the network via `GPR_ADDR` and `GPR_REDIS_ADDR`.
+**Architecture**: ADX core runs on the main host. The GPU host runs two standalone processes: llama.cpp server (LLM inference) and cpu_scorer.py (batch score pre-computation with PyTorch CUDA). The ADX connects over the network via `GPR_ADDR` and `GPR_REDIS_ADDR`.
 
-### GPU host setup
+### Prerequisites (GPU host)
 
 ```bash
-# On the GPU host:
-docker compose -f deploy/docker-compose.gpu.yml --profile gpu up -d
+# System deps
+apt-get install -y cmake build-essential redis-server
+
+# Python 3.9+ with CUDA torch
+pip3.9 install torch --index-url https://download.pytorch.org/whl/cu118
+pip3.9 install transformers redis pymysql
+
+# llama.cpp with CUDA
+CMAKE_ARGS="-DLLAMA_CUBLAS=on" pip3.9 install llama-cpp-python[server]
+
+# Download models (HF format for scorer, GGUF for llama.cpp)
+pip3.9 install modelscope
+modelscope download --model qwen/Qwen2-1.5B --local_dir /data/models/qwen2-1.5b-hf
+modelscope download --model qwen/Qwen2-1.5B-Instruct-GGUF --local_dir /data/models/qwen2-1.5b-gguf
+
+# Clone project
+git clone https://github.com/jlguo/agentic-adx.git /data/agentic-adx
 ```
 
-This starts 4 services: `redis`, `mysql`, `llama-gpu` (llama.cpp with `--n_gpu_layers -1`), and `gpr-scorer-gpu` (PyTorch CUDA batch scorer).
+### Starting services (GPU host)
+
+```bash
+# Start Redis
+redis-server --daemonize yes
+
+# Start llama.cpp GPU server (port 8000, all layers on GPU)
+nohup python3.9 -m llama_cpp.server \
+  --model /data/models/qwen2-1.5b-gguf/qwen2-1_5b-instruct-q4_k_m.gguf \
+  --host 0.0.0.0 --port 8000 --n_ctx 2048 --n_gpu_layers -1 \
+  > /tmp/llama-server.log 2>&1 &
+
+# Start batch scorer (every 30s, pre-computes scores to Redis)
+nohup python3.9 /data/agentic-adx/gpr/serve/cpu_scorer.py \
+  --model-path /data/models/qwen2-1.5b-hf \
+  --device cuda --score-interval 30 \
+  --mysql-host localhost --redis-addr localhost:6379 \
+  > /tmp/gpr-scorer.log 2>&1 &
+```
 
 ### ADX host configuration
 
-Point the ADX at the GPU host by setting these env vars in `docker-compose.yml`:
+Set these env vars to point at the GPU host:
 
 ```yaml
 environment:
-  GPR_ADDR: <gpu-host-ip>:8080        # llama.cpp GPU server
+  GPR_ADDR: <gpu-host-ip>:8000        # llama.cpp GPU server
   GPR_REDIS_ADDR: <gpu-host-ip>:6379  # Redis with pre-computed GPU scores
 ```
-
-The ADX reads pre-computed GPR scores from Redis (written by `gpr-scorer-gpu`), falling back to direct llama.cpp invocation and finally to a hardcoded fallback (CTR=0.02, CVR=0.01).
 
 ### Scoring flow (GPU mode)
 
 ```
-gpr-scorer-gpu (every 30s):
+gpr-scorer (every 30s):
   MySQL → tokenize → Qwen2-1.5B backbone (CUDA) → CTR/CVR/ECPM heads (CUDA) → Redis
 
 ADX per request:
-  Redis cache hit → O(1) lookup (fast path)
-  Redis cache miss → llama-gpu /v1/chat/completions → fallback scores
+  Redis cache hit → O(1) lookup (fast path, targets <1ms)
+  Redis cache miss → llama.cpp /v1/chat/completions → fallback scores
 ```
 
-### GPU scoring env vars
+### Verification
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `DEVICE` | `auto` | Device override: `auto`, `cuda`, `cuda:0`, `cpu` |
-| `GPR_ADDR` | `localhost:8000` | llama.cpp server address from ADX perspective |
-| `GPR_REDIS_ADDR` | same as `REDIS_ADDR` | Redis for score cache (may be on GPU host) |
+```bash
+# Test llama.cpp GPU server
+curl http://<gpu-host>:8000/v1/models
+
+# Run full test suite (5 tests: scoring, Redis, GPU, latency, model info)
+python3.9 /tmp/test_gpr.py
+```
+
+### Verified performance (RTX 4090 + Qwen2-1.5B Q4_K_M)
+
+| Metric | Value |
+|--------|-------|
+| Model load time | ~1s |
+| VRAM used | 1.8 GB |
+| Scoring latency (3 ads) | P50: 445ms |
+| Scoring variance | ±3ms |
+| GPU utilization | 1,760 MiB allocated |
 
 ## Service Port Map
 
