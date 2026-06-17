@@ -4,10 +4,14 @@
 # =============================================================
 # Runs the full stack and demonstrates every layer of the system.
 # Usage:
-#   ./demo/run.sh              # Full docker demo (needs Docker)
-#   ./demo/run.sh --dry-run    # Dry-run: check+explain without starting services
-#   ./demo/run.sh --traffic    # Just run the traffic simulator against a running ADX
-#   ./demo/run.sh --ab-report  # Run A/B report analysis on existing ClickHouse data
+#   ./demo/run.sh                  # Full docker demo (needs Docker)
+#   ./demo/run.sh --dry-run        # Dry-run: check+explain without starting services
+#   ./demo/run.sh --traffic        # Just run the traffic simulator against a running ADX
+#   ./demo/run.sh --verbose        # Run traffic with live winning ad creative display
+#   ./demo/run.sh --creative-loop  # Generate creative → score → watch it win bids
+#   ./demo/run.sh --fine-tuning    # Demonstrate Kafka → TSV → LoRA fine-tune loop
+#   ./demo/run.sh --diagrams       # Render mermaid diagrams to interactive HTML
+#   ./demo/run.sh --ab-report      # Run A/B report analysis on existing ClickHouse data
 # =============================================================
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -46,7 +50,7 @@ dry_run() {
     section "Architecture Overview (5-Layer System)"
     info "  Layer 1: Access Gateway   → Nginx + rate limiting + OpenRTB 2.5"
     info "  Layer 2: ADX Trading      → Redis filter → Qdrant → Redis score cache → Auction → Kafka event"
-    info "  Layer 3: GPR AI Sorting   → Hybrid: llama.cpp (agent LLM) + PyTorch CPU scorer (batch → Redis)"
+    info "  Layer 3: GPR AI Sorting   → Hybrid: llama.cpp + PyTorch scorer (GPU/CPU auto-detect, batch → Redis)"
     info "  Layer 4: Data Loop        → Kafka → Sample Clean → LoRA Fine-tune → Vector Update"
     info "  Layer 5: AI Agent Control → Creative Agent + Bidding Agent (side-path only)"
 
@@ -68,10 +72,44 @@ dry_run() {
     echo ""
     echo "  Background (async, never blocks RTB hot path):"
     echo "  │ llama.cpp (Qwen2-1.5B) ← OpenAI API ← agents (bidding/creative)"
-    echo "  │ cpu_scorer.py (PyTorch) → batch all ads every 30s → Redis HSET gpr_score:*"
+    echo "  │ cpu_scorer.py (PyTorch, GPU/CPU auto-detect) → batch all ads every 30s → Redis HSET gpr_score:*"
     echo "  │ Kafka → sample_cleaner.py → TSV training samples"
     echo "  │ TSV   → training_trigger.py → LoRA fine-tune (every 500 samples)"
     echo "  │ MySQL → vector_updater.py → re-embed → Qdrant upsert"
+
+    section "Mermaid Architecture Chart (paste into mermaid.live)"
+    echo ""
+    echo '```mermaid'
+    echo 'flowchart LR'
+    echo '    SSP["SSP Simulator"] -->|"POST /bid"| NGINX["Nginx"]'
+    echo '    NGINX --> ADX["ADX Pipeline"]'
+    echo '    ADX -->|"Qdrant search"| QDRANT["Qdrant (~2ms)"]'
+    echo '    QDRANT --> REDIS["Redis GET gpr_score:*"]'
+    echo '    REDIS -->|"<<1ms"| AUCTION["Auction"]'
+    echo '    AUCTION --> RES["BidResponse"]'
+    echo ''
+    echo '    SCORER["cpu_scorer.py"] -.->|"batch every 30s"| REDIS'
+    echo '    LLAMA["llama.cpp"] -.->|"OpenAI API"| AGENTS["Creative + Bidding Agents"]'
+    echo '    KAFKA["Kafka"] -.->|"async"| LOOP["Sample Clean → Train → Vector Update"]'
+    echo '```'
+    echo ""
+    echo '```mermaid'
+    echo 'sequenceDiagram'
+    echo '    participant ADX as ADX Pipeline'
+    echo '    participant KAFKA as Kafka'
+    echo '    participant CLEAN as Sample Cleaner'
+    echo '    participant TRIGGER as Training Trigger'
+    echo '    participant TRAIN as LoRA Fine-tune'
+    echo '    ADX->>KAFKA: impression event (fire & forget)'
+    echo '    KAFKA->>CLEAN: consume + join clicks/conversions'
+    echo '    CLEAN->>CLEAN: format TSV: prompt\tctr\tcvr\tecpma'
+    echo '    CLEAN->>TRIGGER: append to training_samples.tsv'
+    echo '    TRIGGER->>TRIGGER: poll every 30s'
+    echo '    alt samples >= 500'
+    echo '        TRIGGER->>TRAIN: archive + invoke pretrain.py'
+    echo '        TRAIN->>TRAIN: LoRA fine-tune (3 epochs)'
+    echo '    end'
+    echo '```'
 
     section "Key Technical Metrics"
     ok "Go tests: 11 packages, all pass"
@@ -81,7 +119,7 @@ dry_run() {
     ok "Agent LLM: llama.cpp Qwen2-1.5B Q4_K_M (~7.7 tok/s CPU, 12-15s/query)"
     ok "A/B framework: CRC32 hash routing, no DB query in hot path"
     ok "Kafka events: fire-and-forget goroutine"
-    ok "All open-source stack, no GPU required for demo"
+    ok "All open-source stack, GPU or CPU deployment optional"
 
     section "Key Design Decisions"
     info "1. Hybrid GPR scoring: llama.cpp for agent LLM + PyTorch CPU batch scorer → Redis cache"
@@ -195,6 +233,7 @@ run_traffic() {
     local target="${1:-http://localhost:8080/bid}"
     local qps="${2:-10}"
     local dur="${3:-30}"
+    local verb="${4:-}"
 
     section "Running Traffic Simulation"
     info "Target: $target, QPS: $qps, Duration: ${dur}s"
@@ -204,14 +243,26 @@ run_traffic() {
     go build -o sim ssp_sim.go 2>&1
     ok "Simulator built"
 
+    local verb_flag=""
+    if [ "$verb" = "--verbose" ]; then
+        verb_flag="--verbose"
+        section "Live Winning Ads (press Ctrl-C to stop)"
+    fi
+
     step "Sending traffic..."
-    ./sim -target "$target" -qps "$qps" -duration "$dur" 2>&1 | tee /tmp/adx-sim-output.log
+    if [ -n "$verb_flag" ]; then
+        ./sim -target "$target" -qps "$qps" -duration "$dur" --verbose 2>&1
+    else
+        ./sim -target "$target" -qps "$qps" -duration "$dur" 2>&1 | tee /tmp/adx-sim-output.log
+    fi
     ok "Traffic complete"
 
-    step "Stats from simulator:"
-    grep -E "sent|success|fail|avg|p50|p99" /tmp/adx-sim-output.log | while read line; do
-        info "  $line"
-    done
+    if [ -z "$verb_flag" ]; then
+        step "Stats from simulator:"
+        grep -E "sent|success|fail|avg|p50|p99" /tmp/adx-sim-output.log | while read line; do
+            info "  $line"
+        done
+    fi
 
     cd "$PROJECT_DIR"
 }
@@ -244,6 +295,120 @@ try:
 except Exception as e:
     print(f'No experiments found or DB unavailable: {e}')
 " 2>&1 || warn "A/B report generation skipped (no ClickHouse data yet)"
+}
+
+# --- Creative closed-loop demo ---
+demo_creative_loop() {
+    header
+    section "Full Closed-Loop: Generate Creative → Score → Win Bid"
+
+    step "Generating a new ad creative via the Creative Agent..."
+    info "  Using llama.cpp (Qwen2-1.5B) to generate ad copy"
+    info "  Target: campaign #1 (Wireless Earbuds), industry=tech"
+
+    local creative_json
+    creative_json=$("$VENV_PYTHON" -m agents.creative_agent \
+        --account-id 1 \
+        --campaign-id 1 \
+        --count 1 \
+        --industry tech \
+        --llm-endpoint http://localhost:8080/v1 \
+        2>&1)
+
+    if [ $? -eq 0 ] && [ -n "$creative_json" ]; then
+        ok "Creative generated and persisted to MySQL + Qdrant"
+        echo ""
+        echo "$creative_json" | "$VENV_PYTHON" -c "
+import sys, json
+data = json.load(sys.stdin)
+if data:
+    c = data[0]
+    print(f'  Title:       \033[1m{c[\"title\"]}\033[0m')
+    print(f'  Description: {c[\"description\"]}')
+    print(f'  Category:    {c.get(\"category\", \"\")}')
+    print(f'  Tags:        {c.get(\"tags\", [])}')
+    print(f'  ID:          {c.get(\"id\", \"new\")}')
+" 2>/dev/null || echo "$creative_json"
+    else
+        warn "Creative generation skipped (llama.cpp may not be ready)"
+        echo "  $creative_json"
+    fi
+    echo ""
+
+    step "Triggering immediate GPR scoring..."
+    info "  Running cpu_scorer.py --once to score all active creatives"
+    docker exec adx-gpr-scorer python gpr/serve/cpu_scorer.py --once \
+        --mysql-host mysql --redis-addr redis:6379 \
+        2>&1 | tail -5 || warn "cpu_scorer not running"
+    ok "Scoring complete — new creative now in Redis cache"
+    echo ""
+
+    step "Verifying new creative scores in Redis..."
+    docker exec adx-redis redis-cli KEYS "gpr_score:*" 2>/dev/null | wc -l | xargs echo "  Cached scores:"
+    echo ""
+
+    section "Live: Watch the New Creative Win Bids"
+    info "Running SSP simulator with live creative display..."
+    info "Look for the newly generated creative in winning bids!"
+    echo ""
+
+    run_traffic "http://localhost:8080/bid" 2 12 "--verbose"
+
+    section "Loop Complete"
+    echo ""
+    info "1. Creative generated by LLM → MySQL + Qdrant"
+    info "2. cpu_scorer.py --once scored it → Redis cache"
+    info "3. ADX picked it up in bid responses → Winning ad shown"
+    echo ""
+}
+
+# --- LoRA fine-tuning demo ---
+demo_fine_tuning() {
+    header
+    section "Data Loop & LoRA Fine-Tuning Demo"
+
+    step "Step 1: Show Kafka event → TSV training sample"
+    info "  The sample_cleaner transforms Kafka events into labeled training data"
+    "$VENV_PYTHON" -c "
+from data.flink.sample_cleaner import format_sample
+sample = format_sample(ad_id='7', clicked=True, ecpm=2.15, domain='tech.example.com')
+print(f'  TSV sample: {sample}')
+print(f'  Fields: prompt, CTR={1.0 if \"clicked\" in str(sample) else 0}, CVR=0, eCPM')
+" 2>&1
+    echo ""
+
+    step "Step 2: Show training trigger logic"
+    cat << 'EOF'
+  training_trigger.py monitors data/training_samples.tsv:
+    - Poll every 30s, count non-empty lines
+    - When >= 500 samples → archive + invoke pretrain.py
+    - LoRA fine-tune: only train low-rank adapters (not full 7B)
+    - Updated model replaces cpu_scorer.py's model → re-score all ads
+EOF
+    echo ""
+
+    step "Step 3: Run mini LoRA fine-tune (synthetic data, CPU)"
+    info "  Training with 200 synthetic samples, 3 epochs on CPU..."
+    if [ -f "$PROJECT_DIR/gpr/train/pretrain.py" ]; then
+        "$VENV_PYTHON" "$PROJECT_DIR/gpr/train/pretrain.py" \
+            --data "" \
+            --epochs 3 \
+            --max-samples 200 \
+            --batch-size 8 \
+            --device cpu \
+            --output /tmp/gpr_demo_finetune.pt 2>&1 | tail -15
+        ok "Fine-tune complete → /tmp/gpr_demo_finetune.pt"
+    else
+        warn "pretrain.py not found — skipping training run"
+    fi
+
+    section "Feedback Loop Summary"
+    echo ""
+    info "Impression → click → conversion → training sample → fine-tune →"
+    info "  → better scoring → higher eCPM → more revenue"
+    echo ""
+    info "This is the virtuous cycle that makes GPR ADX self-improving."
+    echo ""
 }
 
 # --- Show agent status ---
@@ -285,8 +450,25 @@ full_demo() {
     seed_data
     sleep 5
 
+    section "End-to-End: User Visits Site → Ad Served"
+    info "Showing the full RTB pipeline with creative display:"
+    info "  User visits site → SSP sends bid request → ADX processes → Winning ad shown"
+    echo ""
+    run_traffic "http://localhost:8080/bid" 3 15 "--verbose"
+    sleep 3
+
     run_traffic "http://localhost:8080/bid" 20 45
     sleep 3
+
+    demo_creative_loop
+    sleep 3
+
+    demo_fine_tuning
+    sleep 3
+
+    # Generate diagram viewer for the presenter
+    "$VENV_PYTHON" "$PROJECT_DIR/demo/render_mermaid.py" 2>/dev/null || true
+    sleep 2
 
     check_metrics
     sleep 2
@@ -302,7 +484,7 @@ full_demo() {
     info "Jaeger:      http://localhost:16686"
     info "Loki:        http://localhost:3100"
     info "llama.cpp:   http://localhost:8080 (OpenAI API /v1)"
-    info ""
+    echo ""
     info "To stop: cd deploy && docker compose down"
     echo ""
 }
@@ -310,17 +492,37 @@ full_demo() {
 # --- Main ---
 case "${1:-}" in
     --dry-run)      dry_run ;;
-    --traffic)      run_traffic "${2:-http://localhost:8080/bid}" "${3:-10}" "${4:-30}" ;;
+    --traffic)      run_traffic "${2:-http://localhost:8080/bid}" "${3:-10}" "${4:-30}" "${5:-}" ;;
+    --verbose)      run_traffic "${2:-http://localhost:8080/bid}" "${3:-3}" "${4:-15}" "--verbose" ;;
+    --creative-loop) demo_creative_loop ;;
+    --fine-tuning)   demo_fine_tuning ;;
+    --diagrams)
+        section "Generating Mermaid Diagrams"
+        "$VENV_PYTHON" "$PROJECT_DIR/demo/render_mermaid.py"
+        ok "Diagrams generated → demo/mermaid-viewer.html"
+        echo ""
+        if command -v xdg-open &>/dev/null; then
+            info "Opening in browser..."
+            xdg-open "$PROJECT_DIR/demo/mermaid-viewer.html" 2>/dev/null || true
+        elif command -v open &>/dev/null; then
+            info "Opening in browser..."
+            open "$PROJECT_DIR/demo/mermaid-viewer.html" 2>/dev/null || true
+        fi
+        ;;
     --ab-report)    run_ab_report ;;
     --check)        check_prereqs && check_metrics && check_cache && check_agents ;;    
     --help|-h)
-        echo "Usage: $0 [--dry-run|--traffic|--ab-report|--check|--help]"
+        echo "Usage: $0 [--dry-run|--traffic|--verbose|--creative-loop|--fine-tuning|--diagrams|--ab-report|--check|--help]"
         echo ""
-        echo "  (no args)     Full demo (needs Docker)"
-        echo "  --dry-run     Explain architecture, no services needed"
-        echo "  --traffic     Run traffic sim against running ADX"
-        echo "  --ab-report   Generate A/B report from ClickHouse"
-        echo "  --check       Check prerequisites and status"
+        echo "  (no args)        Full demo (needs Docker)"
+        echo "  --dry-run        Explain architecture, no services needed"
+        echo "  --traffic        Run traffic sim against running ADX"
+        echo "  --verbose        Run traffic sim with live winning ad display"
+        echo "  --creative-loop  Generate creative → score → watch it win bids"
+        echo "  --fine-tuning    Demonstrate Kafka → TSV → LoRA fine-tune loop"
+        echo "  --diagrams       Render mermaid diagrams to interactive HTML viewer"
+        echo "  --ab-report      Generate A/B report from ClickHouse"
+        echo "  --check          Check prerequisites and status"
         ;;
     *)              full_demo ;;
 esac

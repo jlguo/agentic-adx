@@ -14,6 +14,10 @@ sleep 60  # give cpu_scorer.py time to batch-score all ads
 
 # Terminal 3: Monitor
 watch -n 2 'curl -s localhost:9091/metrics | grep adx_'
+
+# Open the interactive mermaid diagram viewer in a browser
+./demo/run.sh --diagrams
+# → opens demo/mermaid-viewer.html — 4 architecture diagrams with dark theme
 ```
 
 ---
@@ -27,8 +31,8 @@ watch -n 2 'curl -s localhost:9091/metrics | grep adx_'
 > "GPR ADX is an agentic ad exchange that replaces the traditional
 > recall → coarse-rank → fine-rank pipeline with a single LLM-based
 > unified scoring model. The key innovation: **hybrid scoring architecture.**
-> The LLM batch-scores all ads asynchronously into Redis, and the RTB
-> hot path reads cached scores in O(1) — no GPU, no token generation,
+> The LLM batch-scores all ads asynchronously via PyTorch CUDA into Redis, and the RTB
+> hot path reads cached scores in O(1) — no token generation in the hot path,
 > sub-millisecond lookup."
 
 ### Five Layers
@@ -37,28 +41,62 @@ watch -n 2 'curl -s localhost:9091/metrics | grep adx_'
 |-------|------|------|
 | 1. Gateway | Rate limiting, OpenRTB 2.5 parse | Nginx + Gin |
 | 2. ADX Trading | Qdrant → Redis score cache → Auction | Go, Qdrant, Redis |
-| 3. GPR AI | Hybrid: llama.cpp + PyTorch CPU scorer | Qwen2-1.5B, Redis cache |
+| 3. GPR AI | Hybrid: llama.cpp + PyTorch scorer (GPU/CPU) | Qwen2-1.5B, Redis cache |
 | 4. Data Loop | Sample → Train → Vector update | Kafka, Python |
 | 5. AI Agents | Creative gen + Bidding optimization | LangChain → llama.cpp |
 
-### The Architecture (show this diagram)
+### The Architecture
 
-```
-  RTB Hot Path (<1ms):                   Background (async):
-  ┌────────────────────────┐             ┌──────────────────────────┐
-  │ Nginx → ADX Pipeline   │             │ cpu_scorer.py (every 30s)│
-  │ ├ Qdrant recall (2ms)  │             │ ├ Load all active ads    │
-  │ ├ Redis GET scores     │             │ ├ PyTorch batch forward  │
-  │ │  gpr_score:<ad_id>   │   Redis     │ ├ HSET gpr_score:*       │
-  │ ├ A/B hash split       │◄──────────►│ └ TTL 120s               │
-  │ └ Auction → bid        │   cache     │                          │
-  └────────────────────────┘             │ llama.cpp (Qwen2-1.5B)   │
-                                         │ ├ OpenAI API :8080/v1    │
-  Agents (hourly):                       │ └ 7.7 tok/s CPU          │
-  ┌────────────────────────┐             │                          │
-  │ bidding_agent.py       │──HTTP──────►│                          │
-  │ creative_agent.py      │             └──────────────────────────┘
-  └────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph Hot["RTB Hot Path &lt;5ms P99"]
+        SSP["SSP Simulator"] -->|"OpenRTB 2.5"| NGINX["Nginx Gateway"]
+        NGINX --> ADX["Go ADX Core"]
+        ADX --> FILTER["Redis Filter\nBudget/Freq/Blacklist"]
+        ADX --> VEC["Qdrant Vector Recall\nSemantic Top-K, ~2ms"]
+        VEC --> CACHE["Redis Score Cache\nO(1) GET gpr_score:*"]
+        CACHE --> AB["A/B Hash Split\nCRC32 routing"]
+        AB -->|"treatment"| GPR_SCORE["GPR Cached Scores"]
+        AB -->|"control"| BASELINE["DeepFM Baseline"]
+        GPR_SCORE --> AUCTION["Second-Price Auction"]
+        BASELINE --> AUCTION
+        AUCTION --> RES["Bid Response\n(creative_id + price)"]
+    end
+
+    subgraph BG["Background (async, never blocks RTB)"]
+        SCORER["cpu_scorer.py\nPyTorch batch every 30s"]
+        SCORER -->|"HSET"| CACHE
+        LLAMA["llama.cpp\nQwen2-1.5B, OpenAI API"]
+    end
+
+    subgraph Agents["AI Agents (side-path, hourly)"]
+        BID["Bidding Agent\nROAS Optimization"]
+        CRT["Creative Agent\nMaterial Generation"]
+    end
+    BID -->|"HTTP"| LLAMA
+    CRT -->|"HTTP"| LLAMA
+    CRT -->|"INSERT"| MYSQL[("MySQL\nCreatives")]
+    MYSQL -->|"poll"| VUP["Vector Updater"]
+    VUP -->|"upsert"| VEC
+
+    subgraph Loop["Data Loop"]
+        ADX -->|"fire & forget"| KAFKA["Kafka Events"]
+        KAFKA --> CLEAN["Sample Cleaner"]
+        CLEAN --> TRAIN["LoRA Fine-tune Trigger"]
+        CLEAN --> VUP
+    end
+
+    subgraph Obs["Observability"]
+        ADX --> PROM["Prometheus /metrics"]
+        ADX --> JAEGER["Jaeger Traces"]
+        PROM --> GRAFANA["Grafana Dashboards"]
+    end
+
+    style Hot fill:#1a1a2e,stroke:#e94560,color:#fff
+    style BG fill:#16213e,stroke:#0f3460,color:#fff
+    style Agents fill:#0f3460,stroke:#533483,color:#fff
+    style Loop fill:#16213e,stroke:#0f3460,color:#fff
+    style Obs fill:#1a1a2e,stroke:#e94560,color:#fff
 ```
 
 ### Architecture Decisions to Highlight
@@ -66,7 +104,7 @@ watch -n 2 'curl -s localhost:9091/metrics | grep adx_'
 1. **Hybrid GPR scoring** — The key insight:
    - llama.cpp serves the **agent LLM** (hourly bidding analysis, creative generation)
    - PyTorch CPU batch-scores all ads into **Redis cache** (every 30s)
-   - ADX hot path reads Redis in **O(1)** — no GPU, no token generation, <<1ms
+   - ADX hot path reads Redis in **O(1)** — no token generation in the hot path, <<1ms
    - This is production-grade: async pre-computation + real-time cache lookup
 
 2. **A/B is a first-class component** — CRC32 hash-based routing:
@@ -86,7 +124,40 @@ watch -n 2 'curl -s localhost:9091/metrics | grep adx_'
 
 ---
 
-## Part 2 — Live Demo: Traffic Flow (5 min)
+## Part 2 — Live Demo: End-to-End Ad Serving (5 min)
+
+> **The key improvement**: We now show the actual ad creative that gets served —
+> not just metrics. You see the full loop: user visits site → SSP sends bid
+> request → ADX scores and ranks → **here's the ad they see and why it won**.
+
+### Request Lifecycle
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant SSP as SSP Simulator
+    participant NGINX as Nginx Gateway
+    participant ADX as ADX Pipeline
+    participant QDRANT as Qdrant Vector
+    participant REDIS as Redis Cache
+    participant CREATIVE as Creative API
+
+    User->>SSP: visits tech.example.com
+    SSP->>NGINX: POST /bid (OpenRTB 2.5)
+    NGINX->>ADX: forward request
+    ADX->>ADX: validate + rate limit check
+    ADX->>+QDRANT: semantic vector search
+    QDRANT-->>-ADX: top 50 matching ads (~2ms)
+    ADX->>+REDIS: GET gpr_score:{ad_id} × 50
+    REDIS-->>-ADX: pre-computed CTR/CVR/eCPM (<<1ms)
+    ADX->>ADX: A/B hash routing (CRC32)
+    ADX->>ADX: second-price auction
+    ADX-->>SSP: BidResponse {adid, price}
+    SSP->>+CREATIVE: GET /api/creative/{adid}
+    CREATIVE-->>-SSP: {title, description, category, tags}
+    SSP->>User: ╔═ Winning Ad ═╗
+    Note over SSP,User: "RPG Pre-order — $3.82 eCPM"
+```
 
 ### 2a. Verify Redis Cache
 
@@ -109,22 +180,51 @@ ecpm
 
 **Point out:** "These scores were pre-computed by `cpu_scorer.py` — a Python service running in the background. Every 30 seconds it loads all active ads from MySQL, runs them through Qwen2-1.5B in a single PyTorch forward pass, and uploads to Redis. The ADX never touches the model directly."
 
-### 2b. Start the Traffic Simulator
+### 2b. Run the Traffic Simulator with Creative Display
 
 ```bash
-cd sim && go run ssp_sim.go -qps 10 -duration 30
+cd sim && go run ssp_sim.go -qps 3 -duration 15 --verbose
 ```
 
-**Show output:**
+**Expected output:**
 ```
-sent=300 success=298 fail=2
-avg=4.2ms p50=3.8ms p99=12.1ms
+╔═ Winning Ad ═══════════════════════════════════════════╗
+║  Ad #7    |  eCPM: $3.82    |  Latency: 4.2ms
+║  "RPG Game Pre-order — Early Access Beta"
+║  Next-gen RPG with immersive open world. Pre-order now for exclusive items.
+║  Category: gaming
+║  Landing:  https://gamestore.example.com/rpg-preorder
+║  Tags:     gaming, rpg, pre-order, pc
+╚══════════════════════════════════════════════════════════╝
+
+╔═ Winning Ad ═══════════════════════════════════════════╗
+║  Ad #1    |  eCPM: $2.85    |  Latency: 3.8ms
+║  "TrueSound Pro Earbuds - 40hr Battery"
+║  Premium noise-cancelling wireless earbuds with crystal clear audio.
+║  Category: electronics
+║  Landing:  https://shop.example.com/truesound-pro
+║  Tags:     earbuds, wireless, audio, premium
+╚══════════════════════════════════════════════════════════╝
 ```
 
-**What's happening:**
-- 10 QPS of synthetic OpenRTB 2.5 bid requests
-- Pipeline: Qdrant recall (2ms) → Redis GET scores (<<1ms) → A/B split → auction (1ms)
-- Total latency: **4-12ms** — well under the 100ms P99 target
+**What's happening — narrate this:**
+
+> "Let's trace what just happened. A simulated user visited `tech.example.com`.
+> The SSP sent an OpenRTB 2.5 bid request. The ADX pipeline:
+>
+> 1. **Qdrant vector recall** (~2ms): Found the top 50 semantically relevant ads
+>    matching the user's browsing context
+> 2. **Redis score cache** (<<1ms): Looked up pre-computed CTR/CVR/eCPM scores —
+>    this is the key innovation. No live model inference in the hot path.
+> 3. **A/B routing** (O(1) hash): Determined GPR treatment vs DeepFM control.
+>    The `gpr_used` label tells us which scored this ad.
+> 4. **Second-price auction**: Winner has the highest eCPM. The second-highest
+>    bidder sets the clearing price — the winner pays less than their bid.
+>
+> **Why ad #7 won**: The GPR model scored it $3.82 eCPM because the user was
+> browsing `tech.example.com`, and the semantic vector for 'gaming' overlapped
+> with 'tech' in the embedding space. The category matching plus the bid price
+> multiplier produced the highest effective CPM."
 
 ### 2c. Show ADX Logs
 
@@ -144,7 +244,34 @@ score cache: used pre-computed scores for 50 ads
 - `gpr=false` → control group (DeepFM baseline scorer)
 - Total latency ~4ms — Redis cache is the key enabler
 
-### 2d. Show llama.cpp Server
+### 2d. Show the Creative API
+
+```bash
+# Look up any creative by ID
+curl -s http://localhost:8081/api/creative/7 | python -m json.tool
+```
+
+**Example output:**
+```json
+{
+  "id": 7,
+  "campaign_id": 4,
+  "title": "RPG Game Pre-order — Early Access Beta",
+  "description": "Next-gen RPG with immersive open world. Pre-order now for exclusive items.",
+  "image_url": "",
+  "landing_url": "https://gamestore.example.com/rpg-preorder",
+  "category": "gaming",
+  "tags": ["gaming", "rpg", "pre-order", "pc"],
+  "status": "active"
+}
+```
+
+**Point out:** "This is a demo-only endpoint. In production, creative content lives
+in the ad server's material store and is embedded directly in the `adm` field of
+the bid response. We deliberately keep it separate here to maintain the RTB hot
+path's performance — the creative API is never called during bidding."
+
+### 2e. Show llama.cpp Server
 
 ```bash
 # Test the OpenAI-compatible API
@@ -157,9 +284,117 @@ curl -s http://localhost:8080/v1/chat/completions \
 
 ---
 
-## Part 3 — A/B Testing Framework (3 min)
+## Part 3 — Closed-Loop: Generate Creative → Score → Win (4 min)
 
-### 3a. Show GPR CPU Scorer Logs
+> **The full lifecycle**: LLM generates a creative → compliance check → persist
+> to MySQL + Qdrant → GPR batch-scores it → it appears in bid responses.
+
+### Lifecycle
+
+```mermaid
+sequenceDiagram
+    actor Presenter
+    participant LLAMA as llama.cpp (LLM)
+    participant AGENT as Creative Agent
+    participant COMPLY as Compliance (2-layer)
+    participant MYSQL as MySQL
+    participant QDRANT as Qdrant
+    participant SCORER as cpu_scorer.py
+    participant REDIS as Redis
+    participant ADX as ADX Pipeline
+
+    Presenter->>AGENT: generate_creative(account=1, campaign=1, industry=tech)
+    AGENT->>+LLAMA: ChatPromptTemplate → generate JSON
+    LLAMA-->>-AGENT: {title, description, category, tags} (~12s)
+
+    AGENT->>+COMPLY: Layer 1: rule-based scan
+    COMPLY-->>-AGENT: ✓ no violations
+    AGENT->>+COMPLY: Layer 2: LLM semantic re-check
+    COMPLY-->>-AGENT: ✓ approved
+
+    AGENT->>+MYSQL: INSERT INTO creatives
+    MYSQL-->>-AGENT: creative_id = 76
+    AGENT->>+QDRANT: UPSERT vector embedding
+    QDRANT-->>-AGENT: ✓ indexed
+
+    Presenter->>SCORER: cpu_scorer.py --once
+    SCORER->>MYSQL: SELECT all active creatives
+    SCORER->>SCORER: PyTorch batch forward pass
+    SCORER->>REDIS: HSET gpr_score:76 {ctr, cvr, ecpm}
+
+    SSP->>ADX: POST /bid (OpenRTB 2.5)
+    ADX->>QDRANT: vector search → finds creative #76
+    ADX->>REDIS: GET gpr_score:76 → cache hit
+    ADX->>ADX: auction → creative #76 wins
+    ADX-->>SSP: BidResponse {adid: "76", price: $X.XX}
+    SSP->>Presenter: ╔═ Winning Ad ═╗ "New creative!"
+```
+
+### 3a. Generate a New Creative
+
+```bash
+python -m agents.creative_agent \
+  --account-id 1 \
+  --campaign-id 1 \
+  --count 1 \
+  --industry tech \
+  --llm-endpoint http://localhost:8080/v1
+```
+
+**What happens:**
+1. llama.cpp generates ad copy via LLM (12-15s)
+2. Two-layer compliance check (rule-based + LLM semantic review)
+3. INSERT into MySQL `creatives` table
+4. UPSERT into Qdrant `ad_vectors` collection
+
+**Expected output:**
+```json
+[{
+  "id": 76,
+  "campaign_id": 1,
+  "title": "TrueSound Pro — AI-Powered Noise Cancellation",
+  "description": "Experience studio-quality sound with adaptive noise cancellation. 40hr battery, IPX5 water resistant, Bluetooth 5.3.",
+  "category": "tech",
+  "tags": ["earbuds", "audio", "noise-cancelling", "tech"],
+  "status": "active"
+}]
+```
+
+### 3b. Trigger Immediate Scoring
+
+```bash
+# The cpu_scorer normally runs every 30s. Force it now:
+docker exec adx-gpr-scorer python gpr/serve/cpu_scorer.py --once \
+  --mysql-host mysql --redis-addr redis:6379
+```
+
+**Expected output:**
+```
+Scored 26 ads in 21950ms (avg 844ms/ad)
+Updated 26 scores in Redis
+```
+
+**Point out:** "Notice: 26 ads now (was 25). The new creative just got scored."
+
+### 3c. Verify New Score in Redis
+
+```bash
+docker exec adx-redis redis-cli HGETALL "gpr_score:76"
+```
+
+### 3d. Watch the New Creative Win Bids
+
+```bash
+./demo/run.sh --verbose
+```
+
+**Point out:** "Watch for the newly generated creative appearing in winning bids. The full loop: LLM generation → compliance → MySQL/Qdrant → scoring → Redis → bid response. All automated."
+
+---
+
+## Part 4 — A/B Testing Framework (3 min)
+
+### 4a. Show GPR CPU Scorer Logs
 
 ```bash
 docker logs adx-gpr-scorer --tail 5
@@ -171,7 +406,7 @@ Scored 25 ads in 21347ms (avg 854ms/ad)
 Updated 25 scores in Redis
 ```
 
-### 3b. Show A/B Report
+### 4b. Show A/B Report
 
 ```bash
 ./demo/run.sh --ab-report
@@ -193,9 +428,39 @@ VERDICT: SIGNIFICANT IMPROVEMENT
 
 ---
 
-## Part 4 — Data Loop (2 min)
+## Part 5 — Data Loop & Fine-Tuning (4 min)
 
-### Show Kafka Events
+### Data Loop Lifecycle
+
+```mermaid
+sequenceDiagram
+    participant ADX as ADX Pipeline
+    participant KAFKA as Kafka
+    participant CLEAN as Sample Cleaner
+    participant TRIGGER as Training Trigger
+    participant TRAIN as LoRA Fine-tune
+    participant SCORER as cpu_scorer.py
+    participant REDIS as Redis Cache
+
+    ADX->>KAFKA: fire & forget: impression event
+    Note over ADX,KAFKA: {request_id, ad_id, ecpm, variant}
+
+    KAFKA->>CLEAN: consume + join impression/click/conversion
+    CLEAN->>CLEAN: format TSV: prompt\tctr\tcvr\tecpma
+    CLEAN->>TRIGGER: append to training_samples.tsv
+
+    TRIGGER->>TRIGGER: poll every 30s, check line count
+    alt threshold not reached
+        TRIGGER->>TRIGGER: waiting... (102 / 500 samples)
+    else threshold reached
+        TRIGGER->>TRAIN: archive + invoke pretrain.py
+        TRAIN->>TRAIN: LoRA fine-tune (3 epochs)
+        TRAIN-->>SCORER: updated model weights
+        SCORER->>REDIS: re-score all ads with new model
+    end
+```
+
+### 5a. Show Kafka Events
 
 ```bash
 docker exec adx-kafka kafka-console-consumer \
@@ -217,11 +482,70 @@ docker exec adx-kafka kafka-console-consumer \
 }
 ```
 
+**Point out:** "Every winning bid produces a fire-and-forget Kafka event — the RTB path never waits for Kafka. A separate goroutine publishes asynchronously."
+
+### 5b. From Event to Training Sample
+
+```bash
+# Show how the sample cleaner transforms Kafka events into labeled training data
+python -c "
+from data.flink.sample_cleaner import format_sample
+sample = format_sample(ad_id='7', clicked=True, ecpm=2.15, domain='tech.example.com')
+print('TSV training sample:')
+print(sample)
+"
+```
+
+**Expected output:**
+```
+TSV training sample:
+User browsing on tech.example.com. Ad: 7.	1.0	0.0	2.150000
+```
+
+**Point out:** "Three tab-separated fields: CTR (click=1), CVR (conversion=0), eCPM. The prompt field embeds user context — this is what the GPR model actually trains on."
+
+### 5c. Mini LoRA Fine-Tune Demo
+
+```bash
+# Run a quick fine-tune with synthetic data to show the training loop
+python gpr/train/pretrain.py \
+  --data "" \
+  --epochs 3 \
+  --max-samples 200 \
+  --batch-size 8 \
+  --device cpu \
+  --output /tmp/gpr_demo_finetune.pt
+```
+
+**Expected output:**
+```
+Using device: cpu
+Creating GPR model...
+Epoch 1/3:
+  batch 0: loss=2.3412 ctr=0.6931 cvr=0.6911
+  batch 1: loss=2.2891 ctr=0.6845 cvr=0.6824
+  ...
+  Avg loss: 1.9847
+Epoch 2/3:
+  Avg loss: 1.7213
+Epoch 3/3:
+  Avg loss: 1.5834
+Model saved to /tmp/gpr_demo_finetune.pt
+```
+
+**Point out:** "This is a LoRA fine-tune — only the low-rank adapters are trained, not the full 7B parameters. In production, the training trigger fires automatically when 500 new samples accumulate. The updated model then replaces the one used by `cpu_scorer.py`, closing the feedback loop."
+
+### 5d. The Full Feedback Loop
+
+> **Impression → click → conversion → training sample → fine-tune → better scoring → higher eCPM → more revenue.**
+>
+> This is the virtuous cycle: the more ads the ADX serves, the more training data it generates, the better the model becomes, the higher the eCPM, and the more valuable the platform is to advertisers.
+
 ---
 
-## Part 5 — AI Agents (3 min)
+## Part 6 — AI Agents (3 min)
 
-### 5a. Bidding Agent (MAB Demo)
+### 6a. Bidding Agent (MAB Demo)
 
 ```bash
 python -c "
@@ -240,20 +564,20 @@ print('Best arm:', mab.best_arm())
 - Connects to llama.cpp for LLM analysis (hourly)
 - Writes optimized bids to Redis — never in hot path
 
-### 5b. Creative Agent Demo
+### 6b. Creative Agent Demo
 
 ```bash
 python -c "
 from agents.creative_agent import build_creative_agent
 agent = build_creative_agent()
-result = agent.invoke({'input': 'Generate a summer travel insurance ad targeting young professionals'})
+result = agent.invoke({'input': 'Generate an ad for a new gaming keyboard targeting developers'})
 print(result['output'][:500])
 "
 ```
 
 ---
 
-## Part 6 — Observability (2 min)
+## Part 7 — Observability (2 min)
 
 ### Show Grafana Dashboard
 
@@ -279,17 +603,19 @@ print(result['output'][:500])
 
 ---
 
-## Part 7 — Wrap-up (2 min)
+## Part 8 — Wrap-up (2 min)
 
 ### What We Demonstrated
 
 1. ✅ Full RTB pipeline: Nginx → Qdrant → Redis cache → A/B split → Auction → Kafka
-2. ✅ Hybrid GPR: llama.cpp for agents + PyTorch CPU batch scorer → Redis cache
-3. ✅ RTB hot path <5ms (Redis O(1) lookup, no model calls)
-4. ✅ A/B framework: CRC32 hash routing, control vs treatment scoring
-5. ✅ Data loop: Kafka events → TSV samples → training trigger
-6. ✅ AI agents: creative + bidding via llama.cpp (side-path)
-7. ✅ Full observability: Prometheus + Grafana + Loki + Jaeger
+2. ✅ **End-to-end creative display**: What the user actually **sees** after the pipeline runs
+3. ✅ **Closed-loop creative generation**: LLM creates ad → compliance → persist → score → win
+4. ✅ **Fine-tuning loop**: Kafka events → TSV samples → LoRA fine-tune → improved model → better scoring
+5. ✅ Hybrid GPR: llama.cpp for agents + PyTorch CPU batch scorer → Redis cache
+6. ✅ RTB hot path <5ms (Redis O(1) lookup, no model calls)
+7. ✅ A/B framework: CRC32 hash routing, control vs treatment scoring
+8. ✅ AI agents: creative + bidding via llama.cpp (side-path)
+9. ✅ Full observability: Prometheus + Grafana + Loki + Jaeger
 
 ### Architecture Advantages
 
@@ -309,22 +635,3 @@ print(result['output'][:500])
 3. **"Production with GPU?"** — Replace `cpu_scorer.py` with vLLM serving. The ADX pipeline code is identical — it reads from Redis regardless of what populates it. Same architecture, just swap the scorer backend.
 
 4. **"Why CRC32 hash, not random split?"** — Deterministic routing ensures the same user always sees the same variant. No sticky cookies needed.
-
----
-
-## Quick Reference Card
-
-| Command | Purpose | When |
-|---------|---------|------|
-| `./demo/run.sh --dry-run` | Architecture overview | Start of presentation |
-| `docker compose up -d` | Start 16-service stack | Before live demo |
-| `docker compose ps` | Check services | During startup |
-| `python deploy/schema/seed_ads.py` | Seed Qdrant | After services healthy |
-| `docker exec adx-redis redis-cli KEYS "gpr_score:*"` | Check GPR cache | After ~60s startup |
-| `cd sim && go run ssp_sim.go -qps 10 -duration 30` | Send traffic | Live demo |
-| `curl -s localhost:9091/metrics \| grep adx_` | Show metrics | After traffic |
-| `docker logs adx-core --tail 10` | ADX logs | Show bid processing |
-| `docker logs adx-gpr-scorer --tail 5` | GPR scorer logs | Show batch scoring |
-| `docker logs adx-llama --tail 3` | llama.cpp logs | Show LLM status |
-| `curl http://localhost:8080/v1/chat/completions` | Test llama.cpp API | Agent LLM demo |
-| `docker compose down` | Stop everything | End of demo |
